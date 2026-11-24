@@ -7,10 +7,21 @@
 > **结论一句话**: torchft 的失败单元就是副本,UCE 快恢 = **副本 in-process 自愈 + 借 torchft 原生 quorum/heal 完成副本间协调**,不引入 mindio_ttp 控制面。只需新增①UCE 定级入口 ②withdraw/reenroll 成员原语 ③HIGH 数据重物化(复用 per-rank 快照通道)三块;而 withdraw 无法用现有 torchft Python API 实现——**需要 torchft 侧一处最小 Rust 改动**(心跳开关原语),这是全方案唯一必须动 torchft 源码的点,其余全部落在 extensions 层。
 >
 > **代码基线**: torchtitan-npu master @ ac6c27e;torchft 行为引用核对自 torchft **v0.2.0** 源码(Rust `src/lighthouse.rs` / `src/manager.rs`;Python `torchft/manager.py`)。行号基于分析时工作区,后续可能偏移。
+>
+> **容错后端基线**: 当前部署/开发**以 torchft 作为容错后端**(即用户侧 fork,远程 `maxwhale0301/torchft`,下文统称"当前 torchft fork")。本文不引入任何替代后端;全部"动 torchft"的表述均指在当前 torchft fork 上做最小改动,而非更换容错框架。
+>
+> **分层结构导航(step 级 vs 进程级)**: 本文把容错分为**两层**,每章均带"本章层级"标注,要点如下:
+> - **Step 级(本文主体,进程不退出、in-process 自愈)**: §1(问题背景)、§2(目标/决策)、§4(语义映射)、§5(接口)、§6(行为模型)、§9(无 controller 编排)为**纯 step 级**;§3(机制核对)= step 级为主 + heal 跨层;§7(双故障)、§8(盲区)、§11(风险)为**混合**(主体 step 级,含进程级出口);§13 给 step 级实施工作清单;交付=把多数故障挡在进程退出之前;
+> - **进程级(现状基线,进程死亡后调度器重启)**: §12.2/§12.4 讲故障覆盖与已实测拉起机制(torchrun 重启 + heal + ckpt);在本文中承担"step 级挡不住的兜底"角色,不改动;
+> - **跨层共用机制**: torchft quorum/heal/CheckpointTransport(§3.2/§2.2),step 级 HIGH 重物化与进程级 rejoin 走同一条通道;
+> - **两层衔接**: §12.3 升级路径(step 级修复失败/超时/无一致恢复点 → 升级进程级)。
+> 阅读建议: 先读 §1/§2 与本节了解全貌,再按需钻 §5/§6(设计细节)或 §13/§10(实施)。
 
 ---
 
 ## 1. 背景与动机
+
+> **本章层级**: 全章为 **step 级**问题背景(单芯片 HBM UCE 的 step 级处置),不涉及进程级;进程级("整作业失败 → 重新排队 → 磁盘 checkpoint 重训")仅作为 step 级方案的**对照痛点**在 §1.1 出现,其系统性设计见 §12。
 
 ### 1.1 问题:单芯片 HBM 不可纠正错误打挂整作业
 
@@ -48,6 +59,8 @@
 
 ## 2. 目标、边界与决策
 
+> **本章层级**: 全章为 **step 级**目标与决策(§2.1 四条目标、§2.2 决策表、§2.3 边界均围绕"进程内 UCE 自愈");唯一进程级决策是 §2.2 的"兜底"(torchrun 重启 + ckpt,已在该表标注)。
+
 ### 2.1 目标
 
 1. **上层训练代码不变**: torchtitan 主循环、FaultTolerantTrainerEx、模型/优化器构建方式不变,UCE 处理收敛在 extensions 层;
@@ -57,16 +70,18 @@
 
 ### 2.2 已拍板决策
 
-| 决策点 | 选择 | 含义 |
-|---|---|---|
-| 控制面 | **复用 torchft Manager** | 不引入 Controller/Processor;quorum/commit/heal 用 torchft 原生;异常上报走 `report_error` |
-| 数据面 peer 回灌 | **复用 torchft heal**(落后即从 max_step peer 拉 state dict) | 不造副本优化器 send/recv;HIGH 毒块由 heal 全量覆盖 |
-| 设备恢复 | **复用 HcclRecovery** stop→abort→restart→resume | 已跑通;`restart_device(rebuild_all_resources=True)` 内含 UCE 修复 |
-| 成员语义 | **新增 withdraw / reenroll 原语** | 进入 UCE 修复时暂停心跳(wait 型/续训型都需要),修复后恢复——**torchft 无现成 API,需 Rust 小改**(§5.5) |
-| step 语义 | **保持丢弃**(不重算) | 与现有 `StepRecovery`/quorum 流程自洽;重算需牵动 dataloader 与 quorum 对齐 |
-| 定级语义 | **与 torch_npu `check_uce_in_memory` 对齐(0/1/2/3),保守 HIGH 护栏** | 无法自证 LOW 一律判 HIGH → 必走重物化,绝不乐观下放重执行 |
-| 数据修复粒度 | **Phase 1 整副本重物化;Phase 3 rank 级** | 正确性优先,绕开"restart_device 对完好页保留程度"的不确定性 |
-| 兜底 | 现有 torchrun 重启 + 磁盘 ckpt | UCE 快恢不改变安全网,只把多数 UCE 挡在安全网之前 |
+> **层级标注**: 本文区分 step 级(进程内自愈,§4-§11/§13 主体)与进程级(进程死亡后重启兜底,§12)。下表每条决策显式标注其层级归属——**大多数是 step 级**(因本文主体即 step 级 UCE 快恢),仅"兜底"是进程级,"数据面 heal/step 语义丢弃"为两层共用机制。
+
+| 决策点 | 层级 | 选择 | 含义 |
+|---|---|---|---|
+| 控制面 | **step 级 + 进程级** | **复用 torchft Manager** | 不引入 Controller/Processor;quorum/commit/heal 用 torchft 原生;异常上报走 `report_error`(quorum 同时服务 step 级投票与进程级 rejoin) |
+| 数据面 peer 回灌 | **跨层共用** | **复用 torchft heal**(落后即从 max_step peer 拉 state dict) | 不造副本优化器 send/recv;HIGH 毒块由 heal 全量覆盖(step 级重物化与进程级 rejoin 走同一条通道) |
+| 设备恢复 | **step 级** | **复用 HcclRecovery** stop→abort→restart→resume | 进程内设备自愈,进程不退出;已跑通;`restart_device(rebuild_all_resources=True)` 内含 UCE 修复 |
+| 成员语义 | **step 级** | **新增 withdraw / reenroll 原语** | 进入 UCE 修复时暂停心跳(wait 型/续训型都需要),修复后恢复——**torchft 无现成 API,需 Rust 小改**(§5.5)。进程级不需要此原语(进程死亡心跳自然停) |
+| step 语义 | **跨层共用** | **保持丢弃**(不重算) | 与现有 `StepRecovery`/quorum 流程自洽;重算需牵动 dataloader 与 quorum 对齐(step 级丢步续训/进程级 rejoin 后都从已提交点继续) |
+| 定级语义 | **step 级** | **与 torch_npu `check_uce_in_memory` 对齐(0/1/2/3),保守 HIGH 护栏** | 无法自证 LOW 一律判 HIGH → 必走重物化,绝不乐观下放重执行(定级是 step 级恢复入口,进程级无需定级) |
+| 数据修复粒度 | **step 级** | **Phase 1 整副本重物化;Phase 3 rank 级** | 正确性优先,绕开"restart_device 对完好页保留程度"的不确定性 |
+| 兜底 | **进程级** | 现有 torchrun 重启 + 磁盘 ckpt | UCE 快恢不改变安全网,只把多数 UCE 挡在安全网之前(§12.4 路径 A) |
 
 ### 2.3 首期边界(不做什么)
 
@@ -79,9 +94,36 @@
 | 动 mindspore/CANN 源码 | 用户侧跑原生 torch_npu,无此需求 |
 | 同副本多卡 UCE 的 in-process 处理 | Phase 1 限定单卡;多卡直接回退 ckpt(§9.2-3) |
 
+### 2.4 概念辨析:"step 级容错"的两种含义与本文定位
+
+> 吸收自外部评审意见《torchft step 级容错改造建议》(2026-11-24)。该意见指出"step 级容错"在 torchft 语境下有两种含义,本文必须先厘清自己属于哪一种,**避免与"step 级恢复点"方案混淆**:
+
+| 含义 | 定义 | torchft 现状 | 本文定位 |
+|---|---|---|---|
+| **A. step 级提交容错** | step 边界上失败只是**不推进**该 step、不 kill 进程(next step 换新 batch) | **已有**: `should_commit()` + `commit_failures`(`optim.py:53-57`、`manager.py:849`、`lighthouse.rs:301`) | **本文主体**——UCE 快恢 = 在 A 之上加"设备级 in-process 自愈"(丢步 + 修设备 + 重入),进程仍不退出 |
+| **B. step 级恢复点** | 进程真死后**不从 donor 全量 heal**,而是**回退到最近已 commit 的 step 再重放** | **需要新做**(内存 checkpoint/按步拉取/恢复点协商/回退) | **本文不选**: 需付出 HBM 代价(下),与本文"在线快照、内存零成本"原则冲突 |
+
+**关键澄清(与本文语义一致)**: 该意见强调"不 commit 的 step 数据已被消费,next step 是**新 batch**——这是**跳过不是重放**"。这与本文 §2.2 的"丢弃语义"完全一致: 本文(和现有 StepRecovery)做的都是**跳过(丢弃)该 step**,不做 sampler 回退重放。
+
+**若按 B 理解需付出的代价(本文据此排除 B)**:
+
+| 改造点 | 代价/复杂度 | 对本文 |
+|---|---|---|
+| step 级内存 checkpoint(commit 后滚动快照 model+optim+dataloader 游标) | HBM ≈ 再一份 model+optimizer,8 卡口径 ~10-15GB/卡,撞显存上限 | **不采用**——本文方案不常驻快照,heal 时在线导出(§3.2) |
+| transport 按 step 拉取(`PGTransport.recv_checkpoint` 带 `step=N`) | 需扩展 pg_transport.py(仓库已有方案 A 改造基础) | 仅在 Phase 3 评估(见下) |
+| commit 协议"全 or 无"放宽为**多数派提交** | 动 `lighthouse.rs::_quorum_tick`/`should_commit` 聚合 | **不采用**——会破坏同步模式锁步语义(§6.1 行为 1 依赖全 or 无) |
+| dataloader `seek(step)` 回退 | 需扩展 `DistributedDataloader`(现仅 reload/started 对齐) | **不采用**——丢弃语义无需回退游标 |
+| 故障检测粒度下调(连续 N 步未提交判故障) | 大模型单 step ~3s,阈值易误杀慢 rank | 与本文心跳判死(§3.3)正交,不改动 |
+
+**务实建议(该意见的结论,本文采纳为 Phase 3 评估方向)**: 若目标是"比整组 heal 更快恢复",优先级是 **恢复点选择(公共 commit step) > 按 step 拉取 > 只存 model 变体**,以省下健康组对齐等待(实测 heal→stable 2/2 约 13s)。这与本文 Phase 3 的"rank 级精准修复"同向(§13.6),但走的是"回退公共恢复点"而非"全量拉取"路线——Phase 3 二选一评估。
+
+> **边界结论**: 本文的"step 级容错"严格指 **A(提交容错)+ 设备级扩展**;B(step 级恢复点)是独立的优化方向,已识别但明确排除在前置 Phase 之外,避免读者把"step 级容错"误读为"要常驻 step 快照"。
+
 ---
 
 ## 3. torchft 0.2.0 关键机制核对(前置条件)
+
+> **本章层级**: 混合。§3.1(per-step 事务)= **step 级**的基础机制;§3.2(heal)= **跨层共用**(step 级 HIGH 重物化 与 进程级 rejoin 恢复走同一条通道);§3.3(心跳/成员)= **step 级**自主问题(进程级不需停心跳,进程死了心跳自然停);§3.4(用户资产)= **step 级**为主(HcclRecovery/StepRecovery 都是进程内自愈)。
 
 > 本节行号全部实读自 torchft v0.2.0 源码快照。
 
@@ -127,6 +169,8 @@
 
 ## 4. UCE 快恢语义映射(MindSpeed 四步 ↔ torchtitan-npu 现状)
 
+> **本章层级**: 全章为 **step 级**映射(MindSpeed 的"停机/清理、UCE 定级、数据修复、step 回滚"四步都是进程内自愈动作)。进程级对应的现状(torchrun 重启 + ckpt)在 §12.2/§12.4。
+
 | MindSpeed 步骤 | torchtitan-npu 现状 | 结论 |
 |---|---|---|
 | 停机/清理 | ✅ **已有**: `HcclRecovery` 的 `stop_device` → `abort_hccl_comm("reinit")` → `restart_device(rebuild_all_resources=True, disable_tensor_unsafe_check=True)` → 全量 `resume_hccl_comm`(`recovery/hccl.py:154-200`) | 复用 |
@@ -143,6 +187,8 @@
 ---
 
 ## 5. 涉及接口与实现细节
+
+> **本章层级**: 全章为 **step 级**接口(A 设备恢复/B 流基建/C 通信恢复/D 契约,全部服务于进程内自愈)。进程级不需要这些接口(进程重启后从 ckpt 直接恢复)。§5.5 的 withdraw/reenroll 也是 step 级专属(§2.2)。
 
 > 分类沿用 torch_npu 生态口径: **A 设备恢复重活** → **B 流/事件/内存基建** → **C 分布式/通信恢复** → **D 异常契约产物**。与 MindSpeed 附录1 的差异: 小艺表中"缺失需桥接"的项,在 torchft+torch_npu 侧大多数已具备或不需要。
 
@@ -204,6 +250,8 @@ def check_uce_in_memory(device: int) -> int:
 
 **门禁放宽(Phase 1 先决,具体化)**: `StepRecovery.run_step` 的 except 分支,从"只认 `HcclRecoveryError`/`FORCE STOP`"扩展为"**任何设备级 RuntimeError 都先做 UCE 检查**"。UCE 定级必须挂在 `HcclRecovery` 恢复流程内部、对所有恢复入口生效,而非只挂在 RuntimeError 捕获点——覆盖"UCE 表现为集合通信挂死而非直接 RuntimeError"的场景(§9.1)。
 
+> **回应外部评审"collective 失败语义"质疑**(吸收自《torchft step 级容错改造建议》"真正的硬骨头"一节): 该意见提出"HCCL 组一旦报错通常整组失效,几乎无法只丢弃单个 step 继续;重建 PG 会回到 fault group 级恢复"。**本文方案对此质疑的正面回应**: 我们**不是只丢步**,而是先做**进程内设备恢复**(`HcclRecovery`: stop_device → abort_hccl_comm → restart_device → resume_hccl_comm,§5.1/§3.4,该链路已在 FORCE STOP 场景实测)。正是"设备恢复 + 丢步重入"两步合起来,才使"进程活着、collective 挂掉后恢复"成为可能——若只丢步不做设备恢复,则确实如评审所说无法继续,只能退回 fault group 级。本方案的成立性依赖这条已跑通的设备恢复链路。
+
 ### 5.5 新增原语:withdraw / reenroll(本文补充核对的实现缺口)
 
 **为什么要**: in-process 自愈副本心跳不灭 → lighthouse 视为 healthy + `participants` 残留 → 僵尸成员被 fast-quorum 带回每个 quorum → 健康副本空转 + 重入数据错位(§3.3/§6.1)。**不能指望进程假死**(rank 0 宿主设备重启不杀进程,§9.2-2)。
@@ -230,6 +278,8 @@ def reenroll(self):        # 修复 + 重物化完成后
 ---
 
 ## 6. 行为模型与工作流
+
+> **本章层级**: 全章为 **step 级**(行为 1 同步等待 / 行为 2 异步续训,都是 in-process 自愈 + 重入,进程不退出)。两幅时序图中的"回落重启兜底"是 step 级失败后**升级到进程级**的出口,详见 §12.3。
 
 > 两个行为模式共用同一套原语(withdraw/reenroll),区别只在健康副本的处置:
 > - **行为 1(同步等待)**: `min_replica_size = group_size`,健康副本停下等故障副本自愈(TMin复刻 MindSpeed lockstep 语义);
@@ -422,6 +472,8 @@ sequenceDiagram
 
 ## 7. 双副本同时 UCE 故障分析
 
+> **本章层级**: 混合。§7.1-7.3 的主体是 **step 级**内存恢复判定(一致恢复点/决策矩阵/新设计要求——在进程内决定能否互拉重物化);当判定"内存级不可恢复(✗)"时**回退到进程级磁盘 ckpt**(§7.2 决策矩阵末列、§7.3-4 全局回退)。
+
 ### 7.1 统一判据(一致恢复点)
 
 **内存级恢复可行 ⟺ 存在一个 step S,使每个 rank 位置在至少一个副本中持有 step S 的有效状态。** 副本内没有冗余可依赖: `dp_replicate=1`(`trainer.py:62-86`)下每个参数/优化器分片只存在于本副本的一张卡——前向/反向的 unsharded 瞬态副本不可用(非已提交状态、反传后释放,优化器状态在任何瞬态中都不存在)。因此一个 rank 位置的有效状态至多两份: 本副本该卡 + 对位副本该卡。
@@ -452,6 +504,8 @@ sequenceDiagram
 ---
 
 ## 8. 场景盲区分析(系统清点)
+
+> **本章层级**: 混合。§8.1(已覆盖确认)与 §8.2 大部分场景为 **step 级**(副本内协同/多卡 UCE/LOW 护栏/solo 窗口/快照预算等,均为进程内自愈的盲区);其中 **#4 lighthouse SPOF、#5 运维竞争** 与进程级/部署相关(lighthouse 失忆导致整作业重启、运维 drain 节点属于进程级甚至作业级事件)——已在逐条清单表格中标注层级。
 
 ### 8.1 核对后确认已覆盖
 
@@ -499,22 +553,24 @@ sequenceDiagram
 
 ### 8.3 清单汇总
 
-| # | 场景 | 级别 | 处置 |
-| --- | --- | --- | --- |
-| 1 | 副本内健康 rank 协同 | **必须** | 修复状态上报 + start_quorum 前置门 + 等待降级(Phase 1) |
-| 2 | rank 0 故障的非对称 | 理解项 | 统一走 1 的协议,不依赖偶然性 |
-| 3 | 同副本多卡 UCE | Phase 1 限制 | Phase 1 只处理单卡、多卡回退 ckpt;Phase 3 放开 |
-| 4 | lighthouse SPOF | 验证 + 部署 | 实测断连行为;部署上保证其可用性高于训练作业 |
-| 5 | 运维竞争 | 部署约定 | 自愈时间窗内框架先处置 |
-| 6 | LOW 完整性护栏 / 累积效应 | Phase 2 | loss 突变护栏 + 内存阈值主动退避 |
-| 7 | solo 窗口自身 UCE | 设计补全 | 等待对端追平 + heal;超时回退 ckpt |
-| 8 | elastic 加入扰动 | 低 | 释放栅栏兜底;恢复窗口可加 shrink_only |
-| 9 | 快照内存预算 | **验证**(Phase 1) | 节点内存核算,必要时流式导出 |
-| 10 | 恢复后补 ckpt | 可选 | Phase 3 |
+| # | 层级 | 场景 | 级别 | 处置 |
+| --- | --- | --- | --- | --- |
+| 1 | **step 级** | 副本内健康 rank 协同 | **必须** | 修复状态上报 + start_quorum 前置门 + 等待降级(Phase 1) |
+| 2 | **step 级** | rank 0 故障的非对称 | 理解项 | 统一走 1 的协议,不依赖偶然性 |
+| 3 | **step 级** | 同副本多卡 UCE | Phase 1 限制 | Phase 1 只处理单卡、多卡回退 ckpt;Phase 3 放开 |
+| 4 | **进程级/部署** | lighthouse SPOF | 验证 + 部署 | 实测断连行为;部署上保证其可用性高于训练作业 |
+| 5 | **进程级/运维** | 运维竞争 | 部署约定 | 自愈时间窗内框架先处置 |
+| 6 | **step 级** | LOW 完整性护栏 / 累积效应 | Phase 2 | loss 突变护栏 + 内存阈值主动退避 |
+| 7 | **step 级** | solo 窗口自身 UCE | 设计补全 | 等待对端追平 + heal;超时回退 ckpt |
+| 8 | **step 级** | elastic 加入扰动 | 低 | 释放栅栏兜底;恢复窗口可加 shrink_only |
+| 9 | **跨层** | 快照内存预算 | **验证**(Phase 1) | 节点内存核算,必要时流式导出(不满足 → 回退进程级重建) |
+| 10 | **跨层** | 恢复后补 ckpt | 可选 | Phase 3(补的是进程级兜底用的磁盘 ckpt) |
 
 ---
 
 ## 9. 无外部 controller 的编排
+
+> **本章层级**: 全章为 **step 级**(UCE 恢复的 10 阶段编排、4 条路径、共享状态,全部是进程内自愈的"谁在何时做什么")。§9.1 的"兜底 → torchrun 整副本重启"和 §9.3 的"强杀卡死参与者→torchrun 重启"是升级到进程级的出口(§12.3)。
 
 > 不引入 mindio_ttp,等价于去掉外部编排者(controller 检测故障 → 分发阶段命令 → 收 ack)。先戳破一个预设: **MindSpeed 的方案同样是写死的**(`tft_stop_clean.py` 本身就是固定四步脚本),controller 只做分发、不产生智能。所以问题从来不是"要不要写死"——恢复程序必然写死,问题是**规则放在哪、由谁触发**。
 > **答案**: 动作序列写死,"谁在何时进入哪段序列"不写死,由三套机制确定,全部建在 torchft 既有设施上:
@@ -566,9 +622,15 @@ sequenceDiagram
 
 新增共享状态只有两块: ManagerServer 的修复报告 + 等待门(§8.2-1)、heal 元数据携带脏位图(§7.3-2);按迁移决策落在当前 torchft fork 的 `extensions/manager.py` 与 `extensions/recovery/`。
 
+> **基线备注**: 上述落点均基于**当前仍以 torchft 作为容错后端**的现状设计;`extensions/` 路径指 torchtitan-npu 扩展层,`当前 torchft fork` 指用户侧实际部署的 torchft(非独立于 torchft 的新后端,见文档头部"容错后端基线")。
+
 ---
 
 ## 10. 推荐落地路径
+
+> **本章层级**: 全章为 **step 级**落地(Phase 1/2/3 均为进程内自愈能力的构建与验证);两个**进程级出口**——Phase 1 的"回退最近磁盘 ckpt"(无一致恢复点/镜像校验失败)与 Phase 3 的"恢复后补 ckpt",都是为进程级兜底(§12.4)提供衔接,不在 Phase 增量内。
+>
+> **与 §13 的关系**: §10 按**阶段**(Phase 1/2/3)组织落地顺序,§13 按**工作类型与代码归属**列同一批工作量清单。看"先做什么后做什么"读 §10;看"每块工作落在哪个文件/模块"读 §13。两份都覆盖 step 级;进程级兜底(§12.4)不在 Phase 增量内。
 
 ### 10.1 阶段划分
 
@@ -600,18 +662,198 @@ sequenceDiagram
 
 ## 11. 风险与缓解(汇总)
 
-| # | 风险 | 等级 | 缓解策略 |
-|---|---|---|---|
-| 1 | **UCE 契约串未知**(torch_npu 抛错文本 ≠ MindSpeed `UCE ERROR`/`HBM MULTI BIT ECC`) | 中 | WS-0 容器注毒/模拟实测;契约匹配用**子串 + 设备二次确认**(ACL 失败后调 `check_uce_in_memory`,不单靠字符串) |
-| 2 | **`check_uce_in_memory` 定级语义偏差**(HIGH 判成 LOW → 真毒页本地重执行复发) | 中 | 拍板护栏: 无法自证 LOW 一律 HIGH(§2.2/§5.1);验收用例覆盖(§10.3) |
-| 3 | **`disable_tensor_unsafe_check=True` 已全局关掉 unsafe 检查**(毒块可被静默读入算流) | 中 | UCE-HIGH 恢复窗口内数据即将被重物化覆盖,静默读窗口很短;WS-0 评估恢复期临时开启检查 or 接受窗口(§8.2-1 的释放栅栏兜底) |
-| 4 | **僵尸成员被 fast-quorum 带回**(心跳不灭) | 高 | **withdraw/reenroll 原语是必须项**(§5.5),不是可选优化 |
-| 5 | **quorum 超时 → 整副本重启**误杀等待中的健康副本 | 中 | Phase 1 调大 `quorum_timeout_seconds`;Phase 2 healing-aware 重试(§6.1) |
-| 6 | 连续 UCE/恢复风暴 | 低 | 复用 `max_consecutive_hccl_recoveries`;UCE 恢复计入同一计数 |
-| 7 | 随机态/数据迭代器跨步对齐 | 中 | 与既有 FORCE STOP 丢步同一语义: 本步全组否决,所有 rank 同起点;FT dataloader checkpoint 承载 |
-| 8 | 双副本同时 UCE(对位/跨 step) | 中 | §7 决策矩阵: 镜像有效性校验 + dirty-rank 位图 + 释放栅栏 + 全局回退 ckpt |
-| 9 | **CPU 快照宿主内存爆**(全副本同时导出) | 中 | 节点内存核算;不足则分批/流式导出,放宽 quorum_timeout(§8.2-9) |
-| 10 | torchft 版本漂移(fork 0.3.1 vs 部署 0.2.0) | 低 | 设计只依赖 step/quorum/heal 稳定语义;落地前以实际部署 whl 的 API 为准(§10.2-1) |
+> **本章层级**: 混合。绝大多数风险为 **step 级**(UCE 恢复进程内的契约/定级/僵尸/超时等);#8 双故障为 **跨层**(内存恢复=step 级,回退 ckpt=进程级);#10 版本漂移为**通用**(两层共用)。已在表内逐条标注。
+
+| # | 层级 | 风险 | 等级 | 缓解策略 |
+|---|---|---|---|---|
+| 1 | **step 级** | **UCE 契约串未知**(torch_npu 抛错文本 ≠ MindSpeed `UCE ERROR`/`HBM MULTI BIT ECC`) | 中 | WS-0 容器注毒/模拟实测;契约匹配用**子串 + 设备二次确认**(ACL 失败后调 `check_uce_in_memory`,不单靠字符串) |
+| 2 | **step 级** | **`check_uce_in_memory` 定级语义偏差**(HIGH 判成 LOW → 真毒页本地重执行复发) | 中 | 拍板护栏: 无法自证 LOW 一律 HIGH(§2.2/§5.1);验收用例覆盖(§10.3) |
+| 3 | **step 级** | **`disable_tensor_unsafe_check=True` 已全局关掉 unsafe 检查**(毒块可被静默读入算流) | 中 | UCE-HIGH 恢复窗口内数据即将被重物化覆盖,静默读窗口很短;WS-0 评估恢复期临时开启检查 or 接受窗口(§8.2-1 的释放栅栏兜底) |
+| 4 | **step 级** | **僵尸成员被 fast-quorum 带回**(心跳不灭) | 高 | **withdraw/reenroll 原语是必须项**(§5.5),不是可选优化 |
+| 5 | **step 级** | **quorum 超时 → 整副本重启**误杀等待中的健康副本 | 中 | Phase 1 调大 `quorum_timeout_seconds`;Phase 2 healing-aware 重试(§6.1) |
+| 6 | **step 级** | 连续 UCE/恢复风暴 | 低 | 复用 `max_consecutive_hccl_recoveries`;UCE 恢复计入同一计数 |
+| 7 | **step 级** | 随机态/数据迭代器跨步对齐 | 中 | 与既有 FORCE STOP 丢步同一语义: 本步全组否决,所有 rank 同起点;FT dataloader checkpoint 承载 |
+| 8 | **跨层** | 双副本同时 UCE(对位/跨 step) | 中 | §7 决策矩阵: 镜像有效性校验 + dirty-rank 位图 + 释放栅栏 + 全局回退 ckpt(内存恢复=step 级,回退=进程级) |
+| 9 | **step 级** | **CPU 快照宿主内存爆**(全副本同时导出) | 中 | 节点内存核算;不足则分批/流式导出,放宽 quorum_timeout(§8.2-9) |
+| 10 | **通用** | torchft 版本漂移(fork 0.3.1 vs 部署 0.2.0) | 低 | 设计只依赖 step/quorum/heal 稳定语义;落地前以实际部署 whl 的 API 为准(§10.2-1) |
+
+---
+
+## 12. 故障模式覆盖与进程级拉起机制(现状与分工)
+
+> 明确 step 级容错与进程级容错的分工。**界定线**: step 级 = 进程不退出、in-process 自愈;进程级 = 进程死亡后由调度器重启新进程恢复。故障在这两级之间通过"修复超时/失败/无一致恢复点"判定升级(§12.3)。
+>
+> **本节定位**: 回答"**各层容错覆盖哪些故障、进程级现状是什么**"(现状与分工);"**要在 torchft 里把 step 级容错做出来需要做哪些工作**"见 **§13 实施工作清单**(两节配套:§12 管"是什么",§13 管"做什么")。
+
+### 12.1 Step 级容错支持的故障模式
+
+前提: 进程身份、模型/优化器对象、通信域定义全部保留,只修"卡住的 collective / 坏的硬件页 / 悬死状态"。
+
+| 故障模式 | 处理机制 | 状态 |
+|---|---|---|
+| **HCCL 集合通信故障(FORCE STOP)**: 通信卡死/超时、watchdog 触发 | `HcclRecovery`: stop_device → abort_hccl_comm → restart_device → resume_hccl_comm → 丢步重试 | ✅ 已实现(`recovery/hccl.py`) |
+| **UCE LOW(2)**: 毒页在临时/空闲块 | `check_uce_in_memory` 定级 2 → `empty_cache` 释放 → 本地重试(不修数据) | ⚠️ 设计(Phase 1) |
+| **UCE HIGH(3)**: 毒页在常驻权重/优化器态 | 设备修复 + 标 safe + **重物化/heal 从对端覆盖**(行为 1 显式触发 / 行为 2 落后 heal) | ⚠️ 设计(Phase 1) |
+| **设备瞬时错误/挂死**(可恢复的设备异常) | 设备 stop/restart 后继续 | ✅ 已实现(广义设备自愈) |
+| **单副本续训**(故障副本 withdraw 期间,行为 2) | `min_replica_size < group_size` → 缩容 quorum,FSDP hook 因 size≤1 直通 | ⚠️ 设计(Phase 2 配置化) |
+| **step 内可丢弃的软件异常**(梯度/反传异常) | `report_error` → `should_commit=false` → 丢弃该步 → 下步重来 | ✅ 已实现 |
+
+### 12.2 进程级容错支持的故障模式
+
+前提: 进程无法继续存活(崩溃/不可恢复),由 torchrun/调度器拉起新进程,从**最后一个已提交/已落盘共识点**恢复。
+
+| 故障模式 | 处理机制 | 状态 |
+|---|---|---|
+| **进程崩溃/被杀**: OOM、段错误、非法指令、assert、异常未被恢复门禁捕获 | torchrun 拉起新进程 → 重新 init → lighthouse 判重入(join_timeout)→ 落后 heal → 追平续训 | ✅ 已实测(rejoin 实验) |
+| **节点/整机故障**: 掉电、断网、宿主机不可用 | 同上(进程整体不可恢复 → 重启) | ✅ 已实现(弹性架构) |
+| **设备不可恢复故障**: `restart_device` 失败、HCCL 无法 resume、UCE 修复失败 | step 级超时/失败 → `_recovery_error` → 整副本 torchrun 重启 + 磁盘 ckpt | ✅ 已实现(兜底安全网) |
+| **双副本同时 UCE 无一致恢复点**: 对位双 HIGH、非对位跨 step | 内存级不可恢复 → **回退最近磁盘 ckpt** + 重启(§7 决策矩阵) | ⚠️ 设计(Phase 1 判据+ST) |
+| **同副本多卡 UCE**(Phase 1 限制期内) | 多卡直接回退 ckpt;Phase 3 放开 | ⚠️ 设计(Phase 1 限定) |
+| **持续恢复失败/恢复风暴**: `max_consecutive_hccl_recoveries` / UCE 计数超限 | 超限 → 整副本重启兜底 | ✅ 已实现(护栏) |
+| **lighthouse 失忆/SPOF**: 重启后 participants/heartbeats 丢失 | 副本断连行为待实测;若 crash 则 lighthouse 重启 = 全作业重启 | ❓ 待验证(§8.2-4) |
+| **CPU 快照内存预算不足**: 无法 in-process 重物化 | 需回退进程级重建(分批/流式导出 before) | ❓ 待验证(§8.2-9) |
+
+### 12.3 升级路径(step→进程级)
+
+```
+step 级失败
+   ├─ 可恢复(LOW/通信/HIGH 重物化成功) → 留在 step 级
+   ├─ 修复超时/超限 → upgrade ↓
+   ├─ 设备不可恢复(restart 失败/HCCL 无法 resume) → upgrade ↓
+   └─ 无一致恢复点(双故障矩阵判✗) → upgrade ↓
+        └─ 进程级: torchrun 重启 + 磁盘 ckpt 恢复
+```
+
+**两边都不直接覆盖的**(属于正确性/运维问题,需另设防护):
+- **静默数据损坏**(非 ECC 类逻辑错误)——无信号,容错层无法触发;
+- **换卡/drain 节点等运维动作**——框架自愈窗口内由运维抢跑,靠部署约定协调(§8.2-5);
+- **LOW 累积效应**(反复隔离 → HBM 缩水 → OOM)——OOM 不在恢复门禁内,Phase 2 需内存阈值主动退避(§8.2-6)。
+
+### 12.4 进程级拉起机制(现状实验基线)
+
+> 基于 2026-10 ~ 2026-11 torchft 容错/弹性实验实录。故障组被 kill 后的拉起有**两条路径**,由 driver 脚本(`run_elastic_exp.sh`, `REJOIN_LAUNCH` 变量)切换:
+
+**路径 A(标准 torchrun 重启,默认)**: 故障注入时 `pkill -9` 杀掉 victim replica 的整组进程(`run_elastic_exp.sh:226-230`,按 rdzv_endpoint / replica-id / 进程组 pgid 三重清理);rejoin 时 driver 再调 `start_replica`——`setsid` 起新的独立进程组,`exec timeout ... python -m torch.distributed.run --nnodes=1 --nproc_per_node=N --max_restarts=0 --rdzv_backend=c10d --rdzv_endpoint=... -m torchtitan_npu.train`(**全新进程**,从 rdzv/checkpoint 重新启动)。重入后靠 lighthouse `join_timeout_ms` + step 落后触发 heal 追平。
+
+**路径 B(daemon-fork 冷启动优化变体,`REJOIN_LAUNCH=daemon`)**: 一个常驻 `import_daemon.py` 进程先 import 全链(`torchtitan_npu.train`,含 torch/torch_npu/torchtitan/torchft,**不碰 NPU**);故障后 driver 写 trigger JSON,daemon `os.fork()` 出 nproc 个 worker——每个 worker **继承已 import 的模块**(省 ~14s import 开销),设置 RANK/LOCAL_RANK/WORLD_SIZE/ASCEND_RT_VISIBLE_DEVICES 后跑 `main()`。fork 前主进程从未初始化 NPU,已证 fork 后子进程可正常 init NPU+hccl+allreduce。
+
+| 维度 | 路径 A(torchrun) | 路径 B(daemon-fork) |
+|---|---|---|
+| 拉起者 | driver 脚本再调 `start_replica` | 常驻 daemon 收到 trigger 后 fork |
+| 进程 | 全新进程(重新 import ↑14-23s) | fork 自 daemon(继承 import,省 import 时间) |
+| 适用 | 标准 rejoin 基线实验 | 冷启动优化对比实验(P1) |
+| 状态 | ✅ 已验证(rejoin 实测 ~50-60s) | ✅ 已验证(fork+NPU/hccl init 可行) |
+
+> 对本文的落点: 最终生产路径建议以 **路径 A** 为进程级兜底基线(UCE 快恢只把多数故障挡在 step 级之前,挡不住的走 torchrun 重启 + heal 追平);路径 B 的 daemon-fork 可作为进程级 RTO 优化方向,但与 step 级 UCE 方案正交(不改变 §12.2 的故障模式覆盖)。
+
+---
+
+## 13. Step 级容错实施工作清单(在 torchft 里支持 step 级容错)
+
+> **本节回答**: "在 torchft 里支持 step 级容错需要做哪些工作"。与 §12 配套(§12 管"覆盖哪些故障/现状是什么",本节管"要做什么");与 §10 落地路径的关系——§10 按**阶段**(Phase 1/2/3)组织,本节按**工作类型与代码归属**重组同一批工作,便于按模块分配落地。
+>
+> **总体判断**: torchft 本身已内建 step 级骨架(quorum/commit/丢步重试,§3.1),用户侧已有设备恢复与丢步续训代码(§3.4)。因此"支持 step 级容错"**不是从零搭**,而是补"**设备级 UCE 场景的 step 级自救**"。核心增量 = ①UCE 定级入口 ②withdraw/reenroll 成员原语 ③HIGH 数据重物化 + 副本内协同。
+
+### 13.1 起点:已具备(不需要做) vs 需新增(要做)
+
+| 类别 | 内容 | 证据 |
+|---|---|---|
+| **已具备(不新增)** | per-step quorum/commit(丢步重试);HCCL FORCE STOP 设备恢复;StepRecovery 丢步续训;heal/快照通道 | §3.1/§3.4,已实现 |
+| **需新增(step 级核心)** | ①UCE 定级入口(门禁放宽 + `check_uce_in_memory`)②withdraw/reenroll 原语 ③HIGH 重物化 + 副本内协同 | §5.1/§5.4/§5.5/§8.2-1 |
+| **进程级(已具备,不改)** | torchrun 重启 + heal 追平;磁盘 ckpt 兜底 | §12.4 路径 A,已实测 |
+
+### 13.2 第 1 组:预备验证(WS-0,容器侧,step 级编码的前置)
+
+| 工作项 | 决定什么 | 关联 |
+|---|---|---|
+| 核对 `torch_npu.npu.check_uce_in_memory` / `_recovery.update_npu_tensor_to_safe` 存在性 | A2 定级/A5 unsafe 解除是直调还是 shim | §5.1 |
+| 实测 UCE 错误串(注毒/模拟下 RuntimeError 文本) | D1 契约匹配写法(子串 + 设备二次确认) | §5.4 |
+| 验证 `restart_device` 对完好页 HBM 内容的保留程度 | Phase 1 整副本重物化 vs 精准修复的选择 | §10.2-2 |
+| 快照宿主内存预算核算(≈每 GB 分片 7GB host RAM) | 重物化通道是否需要流式/分批 | §8.2-9 |
+
+### 13.3 第 2 组:torchft 核心改动(全方案唯一动 torchft 的点,step 级)
+
+| 工作项 | 说明 | 关联 |
+|---|---|---|
+| `ManagerServer.set_heartbeat_enabled(bool)` | Rust `_run_heartbeat` 循环加 `Arc<AtomicBool>` 检查(≈30 行)+ pyi + Python 透传;withdraw/reenroll 的前提 | §5.5 |
+| (可选)heal 元数据携带 dirty-rank 位图 | 恢复方拒绝脏源 rank,双故障正确性 | §7.3-2 |
+
+### 13.4 第 3 组:extensions 层 step 级工作(主要工作量)
+
+| 工作项 | 说明 | 关联 |
+|---|---|---|
+| 门禁放宽:`StepRecovery`/`HcclRecovery.recover` 接受 UCE 错误(不只 FORCE STOP + HcclRecoveryError) | Phase 1 先决;否则 UCE 错误 re-raise 走 torchrun 重启 | §5.4 |
+| UCE 定级入口:`check_uce_in_memory` 0/1/2/3 + 保守 HIGH 护栏 | 无法自证 LOW 一律 HIGH → 必走重物化 | §5.1/§2.2 |
+| LOW 路径:直通现有丢步恢复(`empty_cache` + reset + discard) | 毒页在临时块,本地可修 | §6 |
+| HIGH 路径:标 safe + 重物化(复用 per-rank 快照通道) | 行为 2 靠落后 heal;行为 1 由 ManagerEx 重入前显式触发 | §6.1/§6.2 |
+| `ManagerEx` 加 withdraw/reenroll 薄封装 | 调用 §13.3 的 Rust 原语;副本级成员语义 | §5.5 |
+| 副本内协同协议:故障 rank 上报"修复中+定级";`start_quorum` 前置副本级修复门;健康 rank 降级等待 | 防止 63 个健康 rank 对健康卡空转 stop/restart | §8.2-1 |
+| 镜像有效性校验 + 释放栅栏(重物化完成前不放行 forward) | 双故障正确性;quorum 竞态防护 | §7.3-1/§7.3-3 |
+| 配置:`quorum_timeout` 调大;UCE 计数并入 `max_consecutive_*` | 行为 1 等待上限;防坏卡死循环 | §6.3/§10.1 |
+
+### 13.4A 设备级 in-process 自愈的落地细化(五层视图,对上表工作项的伪代码展开)
+
+> 设备级 in-process 自愈的本质是 **复用已跑通的 HcclRecovery 设备序列作为底座,再加三个扩展点**。全链路:
+
+```
+错误发生 → 捕获/分类 → 定级(先停设备) → 修复设备 → 恢复资源 → 丢步/重物化 → 重入 → 续训
+   └─────────────── 进程内完成,进程不退出 ───────────────┘  └ 超时/失败 → 进程级兜底(§12.3)
+```
+
+**第 1 层 — 触发与分类(§13.4"门禁放宽")**。现有 `StepRecovery.run_step` 只认 `HcclRecoveryError`/`"FORCE STOP"`;扩展为"任何设备级 RuntimeError 都先做 UCE 检查",并用**设备二次确认**(调 `check_uce_in_memory`)兜住规则串不匹配的漏网:
+```python
+def run_step(self, step, data_iterator):
+    try:
+        return step(data_iterator)
+    except RuntimeError as e:
+        if _classify_forcestop(e):          # 既有 FORCE STOP 路径
+            return self._recover_hccl(e)
+        if _looks_like_device_error(e):     # 疑似设备异常(任意设备串 or watchdog 触发)
+            level = _classify_uce(self._device_index)
+            return self._recover_uce(level, e)   # 新增
+        raise                               # 非可恢复 → 进程级兜底
+```
+
+**第 2 层 — 定级(§13.4"UCE 定级入口")**。**必须先 `stop_device` 再 `check_uce_in_memory`**——定级依赖 `aclrtGetMemUceInfo` 的毒页表,stop 让设备错误静态化。LOW(2)= 临时块无需修数据;HIGH(3)= 常驻块需重物化。一律保守 HIGH(§2.2 护栏)。
+
+**第 3 层 — 修复设备(§13.4"LOW/HIGH 路径"的公共底座)**。复用既有 `HcclRecovery._recover_device`(`hccl.py:154-200`)整条: `stop_device` → `abort_hccl_comm("reinit")` → 清 workmeta → `restart_device(rebuild_all_resources=True)` → 遍历 `_pg_map` 全 NPU PG `resume_hccl_comm`。其成立性: mesh/DTensor/FSDP 状态全保留、只修卡住的 collective 与毒页(§5.1/§6 已论证,FORCE STOP 已实测)。UCE 增强点: HIGH 恢复期先 `update_npu_tensor_to_safe` 解除毒块读拦截,再让重物化写入。
+
+**第 4 层 — 状态恢复(§13.4"LOW 路径"/"HIGH 路径")**。LOW 走现有丢步(`empty_cache`+reset+`discard_interrupted_step`);HIGH 重物化二选一: 行为 2 靠落后自动 heal(免费),行为 1 由 `ManagerEx` 重入前**显式触发**同一 per-rank 快照通道(双方 step 相同,lighthouse 不会自动判 heal)。
+
+**第 5 层 — 成员语义与兜底(§13.4"withdraw/reenroll"+"协同协议")**。HIGH 修复开始 withdraw(停心跳 → lighthouse 判死 → 健康副本不空转);修复完成 reenroll + 重入 `start_quorum`;任一环节超时/超限 → 让出到进程级,不硬撑。
+
+> **验证难点不在写代码,而在 WS-0 两个事实**: 真实 UCE 错误串(决定第 1 层写法)与 `check_uce_in_memory` 可用性(决定第 2 层直调还是 shim)。两者未实测前,第 1/2 层实现仍属猜测(§13.2)。
+
+### 13.5 第 4 组:验证(step 级闭环收口)
+
+| 工作项 | 说明 | 关联 |
+|---|---|---|
+| ST 单点注入(抛 `"UCE ERROR"` + 强制 HIGH 定级) | 借鉴 MindSpeed `high_availability_uce_error_ptd.sh`;落 `tests/integration_tests/` | §10.2-3 |
+| ST 双点注入(对位/非对位 × 同/跨 step) | 覆盖 §7 决策矩阵各分支 | §7.3-5 |
+| 验收 3 条 | 判 3 走完整重物化/无法自证 LOW 只能返 3/LOW 只本地重试 | §10.3 |
+
+### 13.6 第 5 组:Phase 2/3 延后工作(step 级增强)
+
+| 工作项 | 阶段 | 说明 |
+|---|---|---|
+| healing-aware quorum 超时重试(区分"peer 在自愈"vs"结果未知") | Phase 2 | 替换 `TorchFTCommitTimeoutError` 直接崩 |
+| `min_replica_size < group_size` 配置化 | Phase 2 | 行为 2 缩容续训前提 |
+| 2 副本缩容为单副本窗口的业务确认 | Phase 2 | 无跨副本冗余的可接受性 |
+| rank 级精准修复(只重物化故障卡分片) | Phase 3 | RTO 优化 |
+| 同副本多卡 UCE 放开 | Phase 3 | Phase 1 限定单卡 |
+| 恢复点路由 + transport 按 step 拉取(与 rank 级精准修复二选一评估) | Phase 3 | 外部评审方向(§2.4): 回退最近公共 commit step + 按步拉取,省健康组对齐等待(实测 ~13s) |
+
+### 13.7 Step 级 vs 进程级工作边界对照
+
+| 维度 | Step 级容错(本文主体) | 进程级容错(现状基线) |
+|---|---|---|
+| 恢复单元 | 进程存活,修复 device/collective/毒页 | 进程死亡,调度器拉起新进程 |
+| 已落地 | HcclRecovery(设备)、StepRecovery(丢步) | torchrun 重启 + heal + ckpt(§12.4 路径 A) |
+| 需新增工作 | §13.2-13.6(定级/withdraw/重物化/协同/验证) | 基本无(沿用 §12.4 路径 A;daemon-fork 为可选 RTO 优化) |
+| 动 torchft 源码 | 1 处 Rust(`set_heartbeat_enabled`) | 无 |
+| 两者衔接 | step 级修复超时/失败/无一致恢复点 → 升级进程级 | §12.3 升级路径 |
+
+> **依赖顺序一句话**: WS-0 核对 → 门禁放宽 → 定级入口 → withdraw/reenroll → HIGH 重物化 → 协同协议 → ST 验证。其中 **withdraw/reenroll 是结构性依赖**(行为 1/2 都靠它解决僵尸成员问题),**WS-0 的 UCE 错误串**决定定级入口写法,建议最先做。
 
 ---
 
@@ -705,5 +947,6 @@ sequenceDiagram
 |---|---|---|
 | 《基于 TorchFT 的 UCE 快恢(副本自愈)设计分析》 | 主干 | 行为模型(§6)/通信域/双故障(§7)/盲区(§8)/编排(§9)/路径(§10)均采纳 |
 | 《torchft step 级 UCE 快恢机制 — 低侵入设计方案》 | 接口稿 | §3 前置条件、§5 接口对照与 A2 伪代码、§11 风险表采纳 |
+| 《torchft step 级容错改造建议》(2026-11-24) | 外部评审意见 | §2.4 概念辨析(step 级容错 A/B 两种含义)采纳;§5.4 "collective 失败语义"质疑的回应;Phase 3 评估方向(恢复点选择/按步拉取) |
 | torchft v0.2.0 源码(`manager.py`/`manager.rs`/`lighthouse.rs`/`_torchft.pyi`/`checkpointing/*`) | 代码依据 | §3 全部行号;§5.5 withdraw 缺口为本文新核对 |
 | `torchtitan-npu/extensions/experiment/torchft/` | 现状依据 | §3.4 复用点清单 |
