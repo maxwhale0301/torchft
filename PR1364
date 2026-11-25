@@ -1,0 +1,162 @@
+# TorchTitan-NPU PR #1364 代码评审建议
+
+**PR 链接：** https://gitcode.com/cann/torchtitan-npu/pull/1364\
+**主题：** 优化 TorchFT P2P heal/rejoin 路径\
+**评审结论：** 优化方向合理，性能收益有数据支撑；合入前应优先补齐
+live-send/live-receive 的正确性约束、异常恢复和配置校验。
+
+## 一、PR 改动概览
+
+PR 主要围绕以下方向优化故障恢复链路：
+
+1.  **消除 NPU dispatch 竞争**：将 snapshot
+    导出从主线程等待路径迁移到后台状态处理路径，减少 quorum
+    等待期间的线程竞争。
+2.  **Device-resident snapshot**：在设备侧生成 snapshot，减少
+    NPU→CPU→NPU 的数据往返。注意 `detach().clone()`
+    仍然会复制数据，并非零拷贝。
+3.  **PGTransport 接入与事件驱动等待**：通过 PGTransport 使用 P2P
+    checkpoint 传输；以 future/event 驱动
+    `wait_quorum`，减少轮询和线程唤醒。
+4.  **修复 TorchFT Optimizer 生命周期及 snapshot 锁**：避免容器包装破坏
+    TorchFT 的 step/quorum 方法；通过锁保护状态读取。
+5.  **接收端 chunk 级即时 apply**：接收一个 chunk 后直接写入目标 live
+    tensor，降低完整 checkpoint buffer 带来的峰值显存。
+6.  **发送端 live tensor 零 clone**：在满足同步条件时直接传输活
+    tensor，避免创建完整 snapshot clone，减少额外 HBM 和导出开销。
+
+## 二、合入前优先处理的正确性问题
+
+### P1：live-send 与传输方式应强制绑定
+
+当前 `TORCHFT_HEAL_SEND_LIVE` 与 `TORCHFT_PGTRANSPORT`
+是独立配置，可能出现启用 live-send、却未使用具备相应同步保证的传输路径。
+
+**风险：** 如果发送过程尚未真正完成，optimizer 就开始更新参数，传输中的
+tensor 可能被修改，导致 checkpoint 内容不一致。
+
+**建议：** - 初始化时校验 live-send 必须使用经过验证的同步
+P2P/PGTransport 路径。 - 更理想的方式是由 transport 暴露能力属性，例如
+`supports_live_tensor_send`，由 Manager 根据传输能力决定是否允许
+live-send。 - 明确传输完成的定义：所有异步通信 work
+完成后，才允许训练状态继续更新。
+
+### P1：live-receive 必须保留 shape/dtype 校验
+
+新路径可能在接收过程中直接执行：
+
+``` python
+target.copy_(base)
+```
+
+并通过返回 target 本身跳过后续 restore
+copy。这样可能绕过原有恢复逻辑中的 shape/dtype 检查。
+
+**风险：** 错误或不兼容的 checkpoint
+可能被广播或转换后写入目标状态，导致恢复结果异常。
+
+**建议：** 在 `copy_` 前显式检查：
+
+``` python
+if target.shape != base.shape:
+    raise ValueError("checkpoint shape mismatch")
+
+if target.dtype != base.dtype:
+    raise ValueError("checkpoint dtype mismatch")
+
+target.copy_(base)
+```
+
+### P1：明确 chunk 接收中途失败时的状态语义
+
+chunk 级即时 apply 会使目标模型/优化器在接收完成前被部分覆盖。
+
+**风险：**
+如果中途通信失败，目标状态可能处于"部分新状态、部分旧状态"的混合状态。
+
+**建议：** - 恢复期间必须禁止训练和 optimizer 更新。 - 所有 chunk
+成功完成并通过完整性检查后，才将恢复状态标记为可用。 -
+失败时明确选择回滚、重新 heal，或销毁当前恢复实例；禁止直接继续训练。 -
+增加 chunk 失败、接收端退出、重试等故障注入测试。
+
+## 三、P2：配置与兼容性问题
+
+### 1. CPU offload 配置可能被早退逻辑跳过
+
+TorchFT Optimizer 容器的特殊早退可能位于 CPU offload 处理逻辑之前。
+
+**建议：** 如果容器支持
+offload，应在容器内部正确处理；如果不支持，应显式报错，避免配置被静默忽略。
+
+### 2. 环境变量需要严格校验
+
+对 chunk size、开关及其他 heal 环境变量进行校验：
+
+-   布尔开关仅接受约定值；
+-   chunk size 必须是正整数；
+-   对过大或过小的值设置合理限制；
+-   不兼容的配置组合应在启动时失败，而不是运行中出现隐蔽错误。
+
+### 3. 私有 API 与异常处理应更稳健
+
+-   明确支持的 TorchFT/PyTorch 版本范围。
+-   对私有符号导入增加必要的版本兼容处理。
+-   避免宽泛捕获 `ImportError` 后直接 `pass`，以免掩盖真实依赖错误。
+-   清理不可达分支和死代码。
+
+## 四、P3：工程质量建议
+
+-   live-receive 写入路径使用明确的 `torch.no_grad()` 语义。
+-   检查 snapshot 回调、模型状态、optimizer
+    状态是否由一致的锁/冻结机制保护。
+-   补充环境变量配置说明和默认值。
+-   确保 PR 中的性能日志、实验脚本与最终 diff 对应同一版本。
+
+## 五、建议补充的测试
+
+### 正确性测试
+
+-   live-send 开启但 PGTransport 未开启；
+-   发送期间故障或终止发送 rank；
+-   接收过程中故障、chunk 丢失或传输异常；
+-   shape/dtype 不匹配的 checkpoint；
+-   snapshot 导出失败后重试；
+-   恢复后比较模型参数、optimizer state 和训练 step；
+-   验证恢复期间不会发生 optimizer 更新。
+
+### 性能测试
+
+-   不同 checkpoint 大小：1GB、5GB、10GB、20GB+；
+-   记录各阶段耗时：
+    -   `T_wait_quorum`
+    -   `T_snapshot`
+    -   `T_transport`
+    -   `T_receive_apply`
+    -   `T_restore`
+    -   `T_resume`
+-   记录发送端和接收端峰值 HBM；
+-   多次重复测试，报告均值、方差及异常值；
+-   使用最终 PR commit 对应的脚本和日志。
+
+## 六、建议的修改优先级
+
+  优先级   修改内容
+  -------- --------------------------------------
+  P1       live-send 与同步传输能力绑定
+  P1       live-receive 恢复 shape/dtype 校验
+  P1       明确 chunk 中途失败后的恢复/回滚策略
+  P2       修复 CPU offload 配置静默失效风险
+  P2       校验环境变量及不兼容配置
+  P2       明确私有 API 的版本兼容范围
+  P3       补充 no-grad、异常处理、死代码清理
+  P3       完善阶段耗时、峰值显存和故障注入实验
+
+## 七、总体评审结论
+
+PR 的主要收益来自减少恢复路径中的额外复制、CPU 往返和接收端完整
+buffer，优化方向合理，性能数据具有工程价值。
+
+但 live-send/live-receive 将恢复路径从"传输独立、稳定的
+snapshot"转变为"直接读取或修改活状态"，因此必须明确状态冻结、通信完成、恢复提交和失败处理之间的契约。
+
+**建议：优先修复 P1 正确性问题，并补充恢复失败场景测试后再合入。**
